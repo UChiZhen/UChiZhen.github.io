@@ -1,0 +1,748 @@
+---
+title: "Finding Alpha in Chicago's Disinvested Communities"
+subtitle: "A Spatial-Alpha Index Combining 2SFCA Transit Accessibility and Local Moran's I"
+author: "Zhen Zeng"
+date: today
+output-file: index.html
+format:
+  html:
+    toc: true
+    toc-float: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+    fig-width: 9
+    fig-height: 7
+    smooth-scroll: true
+execute:
+  warning: false
+  message: false
+  results: hide
+knitr:
+  opts_chunk:
+    fig.align: center
+---
+
+```{r one-time-setup}
+#| label: one-time-setup
+#| eval: false
+#| include: true
+
+# One-time install of packages missing from this machine's R library.
+# (Detected via installed.packages(); already-installed deps are not relisted.)
+install.packages(c("here", "rgeoda"))
+
+# Optional: pin versions with renv
+# renv::init()
+# renv::snapshot()
+```
+
+```{r setup}
+#| label: setup
+#| include: false
+
+# ---- Reproducibility ----
+# Project can be pinned with {renv}; {here} keeps paths relative to the repo.
+
+library(here)
+library(tidyverse)
+library(sf)
+library(tigris)        # Census TIGER/Line geographies
+library(tidycensus)    # ACS pull (requires CENSUS_API_KEY env var)
+library(rgeoda)        # Local Moran's I (LISA)
+library(leaflet)
+library(gt)
+library(DT)
+library(crosstalk)
+library(htmltools)
+library(httr2)
+library(janitor)
+library(scales)
+library(RColorBrewer)
+
+# tigris config: cache shapefiles, return sf, use 2022 vintage
+options(
+  tigris_use_cache = TRUE,
+  tigris_class     = "sf"
+)
+
+# Census API key from environment (never hardcode)
+if (Sys.getenv("CENSUS_API_KEY") != "") {
+  census_api_key(Sys.getenv("CENSUS_API_KEY"), install = FALSE)
+}
+
+# Projected CRS for Chicago: NAD83 / Illinois East (meters)
+CRS_PROJ <- 26971
+CRS_GEO  <- 4326
+
+# Year vintage for ACS + permit window
+ACS_YEAR     <- 2022
+PERMIT_YEARS <- 2019:2024
+
+# 2SFCA catchment radius (meters)
+CATCHMENT_M <- 1000
+```
+
+# 1. Introduction & Research Question
+
+Impact investors increasingly seek **place-based alpha** — neighborhoods whose
+underlying fundamentals (transit, density, demographics) suggest stronger
+performance than current capital flows imply. This report operationalizes that
+intuition for **Chicago at the Census tract level** by combining:
+
+- a **2-Step Floating Catchment Area (2SFCA)** measure of accessibility to the
+  CTA "L" rapid-transit network (the *high-potential* signal), and
+- **Local Moran's I (LISA)** on a composite **Spatial Alpha Index** that
+  subtracts realized investment intensity (building-permit dollars per housing
+  unit) from that accessibility score.
+
+> **Research question.** *Where in Chicago do statistically significant clusters
+> of high transit accessibility coincide with low realized investment, and
+> what do those clusters look like demographically?*
+
+The **High–High LISA clusters** of the alpha index are the report's headline
+output: contiguous areas of "transit-rich but capital-starved" tracts that
+constitute the strongest *prima facie* targets for catalytic capital.
+
+# 2. Data Sources & Cleaning
+
+The analysis combines three independent, free sources rather than relying solely on ACS:
+
+| # | Source | Role | Endpoint |
+|---|--------|------|----------|
+| 1 | **Chicago Data Portal — Building Permits** | Investment intensity (low = under-invested) | `data.cityofchicago.org/resource/ydr8-5enu` |
+| 2 | **Chicago Data Portal — CTA "L" Stations** | Supply side of 2SFCA | `data.cityofchicago.org/resource/8pix-ypme` |
+| 3 | **ACS 5-yr (`tidycensus`)** | Population & housing denominators, descriptive covariates | Census Bureau API |
+
+::: {.panel-tabset}
+
+## Geographies
+
+```{r geographies}
+#| label: geographies
+#| cache: true
+
+# Cook County tracts (ACS 2022 vintage)
+cook_tracts <- tracts(
+  state = "IL", county = "Cook",
+  cb = TRUE, year = ACS_YEAR
+) |>
+  st_transform(CRS_PROJ) |>
+  select(GEOID, NAME_tract = NAME, ALAND)
+
+# City of Chicago boundary (TIGER Place file)
+chicago_boundary <- places(state = "IL", cb = TRUE, year = ACS_YEAR) |>
+  filter(NAME == "Chicago") |>
+  st_transform(CRS_PROJ) |>
+  st_union()
+
+# Clip tracts to city: keep tracts whose centroid lies in Chicago.
+# (Centroid test avoids slivers from boundary irregularities.)
+tract_centroids <- st_centroid(cook_tracts)
+in_city <- st_within(tract_centroids, chicago_boundary, sparse = FALSE)[, 1]
+chi_tracts <- cook_tracts[in_city, ]
+
+# Drop O'Hare-style non-residential outliers later via housing-unit filter.
+```
+
+## ACS pull
+
+```{r acs}
+#| label: acs
+#| cache: true
+
+acs_raw <- get_acs(
+  geography = "tract",
+  state     = "IL",
+  county    = "Cook",
+  variables = c(
+    total_pop     = "B01003_001",
+    housing_units = "B25001_001",
+    med_hh_income = "B19013_001",
+    renter_occ    = "B25003_003",
+    occ_total     = "B25003_001",
+    white_nh      = "B03002_003",
+    total_race    = "B03002_001"
+  ),
+  year      = ACS_YEAR,
+  survey    = "acs5",
+  output    = "wide",
+  geometry  = FALSE
+) |>
+  clean_names() |>
+  transmute(
+    geoid          = geoid,
+    total_pop      = total_pop_e,
+    housing_units  = housing_units_e,
+    med_hh_income  = med_hh_income_e,
+    pct_renter     = ifelse(occ_total_e > 0, renter_occ_e / occ_total_e, NA_real_),
+    pct_nonwhite   = ifelse(total_race_e > 0, 1 - white_nh_e / total_race_e, NA_real_)
+  )
+```
+
+## CTA "L" stations
+
+```{r lstops}
+#| label: lstops
+#| cache: true
+
+l_stops_path <- here("data", "raw", "cta_l_stops.geojson")
+
+if (!file.exists(l_stops_path)) {
+  # Socrata GeoJSON endpoint — no auth needed for moderate pulls
+  req <- request("https://data.cityofchicago.org/resource/8pix-ypme.geojson") |>
+    req_url_query(`$limit` = 5000)
+  resp <- req_perform(req)
+  writeBin(resp_body_raw(resp), l_stops_path)
+}
+
+l_stops_raw <- st_read(l_stops_path, quiet = TRUE) |>
+  st_transform(CRS_PROJ)
+
+# Each row is a station ENTRANCE; collapse to one point per station_id
+l_stations <- l_stops_raw |>
+  group_by(station_name) |>
+  summarise(geometry = st_centroid(st_union(geometry)), .groups = "drop") |>
+  mutate(station_id = row_number())
+```
+
+## Building permits (investment proxy)
+
+```{r permits}
+#| label: permits
+#| cache: true
+
+permits_path <- here("data", "raw", "chi_permits.csv")
+
+if (!file.exists(permits_path)) {
+  # Pull only what we need: residential-relevant permits 2019-2024, with $ valuation
+  # Dataset: ydr8-5enu (Building Permits)
+  # We page through Socrata to stay polite (50k rows per pull)
+  base <- "https://data.cityofchicago.org/resource/ydr8-5enu.csv"
+  fields <- "id,permit_,permit_type,application_start_date,issue_date,reported_cost,latitude,longitude"
+  where  <- sprintf(
+    "issue_date >= '%d-01-01T00:00:00' AND issue_date < '%d-01-01T00:00:00' AND reported_cost > 0 AND latitude IS NOT NULL",
+    min(PERMIT_YEARS), max(PERMIT_YEARS) + 1
+  )
+
+  pulls <- list()
+  offset <- 0
+  repeat {
+    req <- request(base) |>
+      req_url_query(
+        `$select` = fields,
+        `$where`  = where,
+        `$limit`  = 50000,
+        `$offset` = offset
+      )
+    # Force all-character on read so column types are consistent across chunks
+    # (Socrata sometimes returns numeric-looking IDs that later contain letters,
+    # which makes readr guess different types per chunk -> bind_rows fails.)
+    chunk <- read_csv(
+      resp_body_string(req_perform(req)),
+      show_col_types = FALSE,
+      col_types      = cols(.default = "c")
+    )
+    if (nrow(chunk) == 0) break
+    pulls[[length(pulls) + 1]] <- chunk
+    if (nrow(chunk) < 50000) break
+    offset <- offset + 50000
+  }
+  permits_dl <- bind_rows(pulls)
+  write_csv(permits_dl, permits_path)
+}
+
+# Read cached file as character, coerce numerics explicitly below.
+permits_raw <- read_csv(
+  permits_path,
+  show_col_types = FALSE,
+  col_types      = cols(.default = "c")
+)
+
+# Clean: keep construction-related permits, drop fee-only / sign permits
+permits_clean <- permits_raw |>
+  clean_names() |>
+  mutate(
+    reported_cost = suppressWarnings(as.numeric(reported_cost)),
+    latitude      = suppressWarnings(as.numeric(latitude)),
+    longitude     = suppressWarnings(as.numeric(longitude))
+  ) |>
+  filter(
+    !is.na(latitude), !is.na(longitude),
+    !is.na(reported_cost), reported_cost > 0,
+    str_detect(
+      str_to_lower(permit_type),
+      "new construction|renovation|alteration|addition"
+    )
+  )
+
+permits_sf <- permits_clean |>
+  st_as_sf(coords = c("longitude", "latitude"), crs = CRS_GEO) |>
+  st_transform(CRS_PROJ)
+```
+
+## Aggregate to tracts
+
+```{r aggregate}
+#| label: aggregate
+
+# Spatial join: each permit -> tract GEOID
+permits_tract <- st_join(permits_sf, chi_tracts[, "GEOID"], left = FALSE)
+
+permit_summary <- permits_tract |>
+  st_drop_geometry() |>
+  group_by(GEOID) |>
+  summarise(
+    n_permits      = n(),
+    total_value    = sum(reported_cost, na.rm = TRUE),
+    .groups        = "drop"
+  )
+
+# Merge ACS + permits onto tract polygons
+tract_data <- chi_tracts |>
+  left_join(acs_raw, by = c("GEOID" = "geoid")) |>
+  left_join(permit_summary, by = "GEOID") |>
+  mutate(
+    n_permits     = replace_na(n_permits, 0L),
+    total_value   = replace_na(total_value, 0),
+    value_per_hu  = ifelse(housing_units > 0, total_value / housing_units, NA_real_),
+    log_value_hu  = log1p(value_per_hu)
+  ) |>
+  # Drop non-residential / empty tracts (e.g., O'Hare, industrial slivers)
+  filter(housing_units >= 50, !is.na(total_pop), total_pop >= 100)
+```
+
+:::
+
+# 3. Methodology
+
+## 3.1 Method A — 2-Step Floating Catchment Area (2SFCA)
+
+Standard 2SFCA (Luo & Wang 2003) computed against CTA "L" stations:
+
+**Step 1** — for each station *j*, compute the station-to-population ratio
+$R_j = S_j / \sum_{k \in N(j, d_0)} P_k$, where $S_j = 1$ (each station treated
+as one unit of "rapid-transit supply"), $N(j, d_0)$ is the set of tract
+centroids within $d_0 = 1{,}000$ m, and $P_k$ is tract *k* population.
+
+**Step 2** — for each tract *i*, sum the ratios of all stations within
+$d_0$ of its centroid: $A_i = \sum_{j \in N(i, d_0)} R_j$.
+
+Euclidean distance is used as a documented simplification; street-network
+distance would refine catchments, especially near rail lines and barriers, and is a logical extension.
+
+```{r sfca}
+#| label: sfca
+
+# Tract centroids (projected)
+tract_pts <- tract_data |>
+  mutate(centroid = st_centroid(geometry)) |>
+  st_drop_geometry() |>
+  st_as_sf(sf_column_name = "centroid")
+
+# Distance matrices (meters): tract <-> station
+d_ts <- st_distance(tract_pts, l_stations) |> units::drop_units()
+in_catch <- d_ts <= CATCHMENT_M  # logical matrix, rows = tracts, cols = stations
+
+# --- Step 1: each station's served population, then R_j ---
+pop_vec <- tract_pts$total_pop
+station_pop <- colSums(in_catch * pop_vec, na.rm = TRUE)
+R_j <- ifelse(station_pop > 0, 1 / station_pop, 0)
+
+# --- Step 2: sum R_j over stations in each tract's catchment ---
+A_i <- as.numeric(in_catch %*% R_j)
+
+# Scale by 100,000 for human-readable magnitudes
+tract_data$sfca_score <- A_i * 1e5
+```
+
+## 3.1.1 Catchment-Radius Sensitivity
+
+Because Euclidean catchments are a modeling choice, the 2SFCA score is also
+recomputed at 800 m and 1,200 m. The rank correlation against the headline
+1,000 m score indicates whether the accessibility signal is stable to modest
+radius changes.
+
+```{r sfca-sensitivity}
+#| label: sfca-sensitivity
+#| results: asis
+
+compute_sfca <- function(radius_m) {
+  catch <- d_ts <= radius_m
+  served_pop <- colSums(catch * pop_vec, na.rm = TRUE)
+  ratios <- ifelse(served_pop > 0, 1 / served_pop, 0)
+  as.numeric(catch %*% ratios) * 1e5
+}
+
+sfca_sensitivity <- tibble(radius_m = c(800, CATCHMENT_M, 1200)) |>
+  mutate(score = map(radius_m, compute_sfca)) |>
+  transmute(
+    `Catchment radius` = paste0(radius_m, " m"),
+    `Tracts with station access` = map_int(score, ~sum(.x > 0, na.rm = TRUE)),
+    `Mean 2SFCA` = map_dbl(score, ~mean(.x, na.rm = TRUE)),
+    `90th pct. 2SFCA` = map_dbl(score, ~quantile(.x, 0.9, na.rm = TRUE)),
+    `Spearman rho vs. 1 km` = map_dbl(
+      score,
+      ~cor(.x, tract_data$sfca_score, method = "spearman", use = "complete.obs")
+    )
+  )
+
+sfca_sensitivity |>
+  gt() |>
+  tab_header(title = md("**2SFCA Sensitivity to Catchment Radius**")) |>
+  fmt_number(c(`Mean 2SFCA`, `90th pct. 2SFCA`), decimals = 2) |>
+  fmt_number(`Spearman rho vs. 1 km`, decimals = 3) |>
+  opt_row_striping()
+```
+
+## 3.2 Method B — Spatial Alpha Index + Local Moran's I
+
+The **Spatial Alpha Index** combines the two signals on a common scale:
+
+$$
+\alpha_i = z(\text{SFCA}_i) - z(\log(1 + \text{value\_per\_hu}_i))
+$$
+
+Positive $\alpha_i$ = more accessibility than investment. We then test whether
+high $\alpha$ values cluster spatially using Local Moran's I with queen
+contiguity weights and 999 permutations.
+
+```{r lisa}
+#| label: lisa
+
+# Build alpha index from z-scored components
+tract_data <- tract_data |>
+  mutate(
+    z_sfca   = as.numeric(scale(sfca_score)),
+    z_invest = as.numeric(scale(log_value_hu)),
+    alpha    = z_sfca - z_invest
+  )
+
+# rgeoda needs an sf with no missing values on the focal variable
+lisa_input <- tract_data |>
+  filter(!is.na(alpha), is.finite(alpha))
+
+w <- rgeoda::queen_weights(lisa_input)
+
+set.seed(20260517)
+lm_res <- rgeoda::local_moran(
+  w, lisa_input["alpha"],
+  permutations = 999
+)
+
+lisa_input$lisa_I       <- lisa_values(lm_res)
+lisa_input$lisa_p       <- lisa_pvalues(lm_res)
+lisa_input$lisa_cluster <- factor(
+  lisa_labels(lm_res)[lisa_clusters(lm_res, cutoff = 0.05) + 1],
+  levels = c("Not significant", "High-High", "Low-Low", "Low-High", "High-Low", "Undefined", "Isolated")
+)
+
+# Join LISA results back onto the full tract dataset
+tract_data <- tract_data |>
+  left_join(
+    st_drop_geometry(lisa_input) |>
+      select(GEOID, lisa_I, lisa_p, lisa_cluster),
+    by = "GEOID"
+  )
+```
+
+# 4. Results
+
+## 4.1 Top-Alpha Tracts (publication table)
+
+The table ranks tracts by alpha within the **High-High LISA cluster** — the
+statistically significant under-invested + high-potential set. ACS profile
+columns are included here so the target tracts can be interpreted as places,
+not only as spatial-statistical outputs.
+
+```{r gt-table}
+#| label: gt-table
+#| results: asis
+
+top_alpha <- tract_data |>
+  st_drop_geometry() |>
+  filter(lisa_cluster == "High-High", lisa_p <= 0.05) |>
+  arrange(desc(alpha)) |>
+  slice_head(n = 15) |>
+  transmute(
+    GEOID,
+    Population    = total_pop,
+    `Housing units` = housing_units,
+    `Median HH inc.` = med_hh_income,
+    `% Renter`    = pct_renter,
+    `% Non-white` = pct_nonwhite,
+    `Permit $ / HU` = value_per_hu,
+    `SFCA score`  = sfca_score,
+    Alpha         = alpha,
+    `LISA p`      = lisa_p
+  )
+
+top_alpha |>
+  gt() |>
+  tab_header(
+    title    = md("**Chicago's Top 15 'Alpha' Tracts**"),
+    subtitle = "High transit accessibility + low realized investment (HH cluster, p ≤ 0.05)"
+  ) |>
+  fmt_number(c(Population, `Housing units`), decimals = 0, use_seps = TRUE) |>
+  fmt_currency(c(`Median HH inc.`, `Permit $ / HU`), decimals = 0) |>
+  fmt_percent(c(`% Renter`, `% Non-white`), decimals = 1) |>
+  fmt_number(c(`SFCA score`, Alpha), decimals = 2) |>
+  fmt_number(`LISA p`, decimals = 3) |>
+  data_color(
+    columns = Alpha,
+    fn      = scales::col_numeric(palette = "Greens", domain = NULL)
+  ) |>
+  data_color(
+    columns = `Permit $ / HU`,
+    fn      = scales::col_numeric(palette = "Reds", domain = NULL, reverse = TRUE)
+  ) |>
+  tab_source_note(md(
+    "*Sources:* ACS 5-yr (2018-2022); Chicago Data Portal Building Permits 2019-2024; CTA L Stations."
+  )) |>
+  opt_row_striping() |>
+  tab_options(table.font.size = px(13))
+```
+
+## 4.2 Citywide Summary
+
+This table compares the target cluster against all other LISA categories. The
+median income, renter share, and non-white share columns summarize the ACS
+context behind the alpha signal.
+
+```{r summary-gt}
+#| label: summary-gt
+#| results: asis
+
+tract_data |>
+  st_drop_geometry() |>
+  filter(!is.na(lisa_cluster)) |>
+  group_by(`LISA category` = lisa_cluster) |>
+  summarise(
+    `# tracts`        = n(),
+    `Pop (median)`    = median(total_pop, na.rm = TRUE),
+    `Med HH inc`      = median(med_hh_income, na.rm = TRUE),
+    `% renter med`    = median(pct_renter, na.rm = TRUE),
+    `% non-white med` = median(pct_nonwhite, na.rm = TRUE),
+    `Permit $/HU med` = median(value_per_hu, na.rm = TRUE),
+    `SFCA median`     = median(sfca_score, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  gt() |>
+  tab_header(title = md("**Tract Profile by LISA Cluster**")) |>
+  fmt_number(c(`Pop (median)`, `# tracts`), decimals = 0, use_seps = TRUE) |>
+  fmt_currency(c(`Med HH inc`, `Permit $/HU med`), decimals = 0) |>
+  fmt_percent(c(`% renter med`, `% non-white med`), decimals = 1) |>
+  fmt_number(`SFCA median`, decimals = 2) |>
+  opt_row_striping()
+```
+
+## 4.3 Interactive Maps
+
+::: {.panel-tabset}
+
+### Investment intensity
+
+```{r map-invest}
+#| label: map-invest
+#| results: markup
+
+geo <- tract_data |> st_transform(CRS_GEO)
+
+pal_inv <- colorNumeric("YlOrRd", domain = geo$log_value_hu, na.color = "#dddddd")
+
+leaflet(geo) |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addPolygons(
+    fillColor = ~pal_inv(log_value_hu),
+    weight    = 0.4, color = "white", fillOpacity = 0.85,
+    label     = ~sprintf(
+      "Tract %s<br>Permit $/HU: %s<br>Permits: %d",
+      GEOID,
+      dollar(value_per_hu, accuracy = 1),
+      n_permits
+    ) |> lapply(htmltools::HTML),
+    highlightOptions = highlightOptions(weight = 2, color = "#222", bringToFront = TRUE)
+  ) |>
+  addLegend(
+    "bottomright", pal = pal_inv, values = ~log_value_hu,
+    title = "log(1 + $/HU)", opacity = 0.85
+  )
+```
+
+### Transit accessibility (2SFCA)
+
+```{r map-sfca}
+#| label: map-sfca
+#| results: markup
+
+pal_sf <- colorNumeric("BuPu", domain = geo$sfca_score, na.color = "#dddddd")
+stations_geo <- l_stations |> st_transform(CRS_GEO)
+
+leaflet(geo) |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addPolygons(
+    fillColor = ~pal_sf(sfca_score),
+    weight    = 0.4, color = "white", fillOpacity = 0.85,
+    label     = ~sprintf("Tract %s<br>SFCA: %.2f", GEOID, sfca_score) |>
+      lapply(htmltools::HTML),
+    group     = "Tracts"
+  ) |>
+  addCircleMarkers(
+    data   = stations_geo,
+    radius = 3, color = "#111", fillColor = "#fdae61",
+    weight = 0.6, fillOpacity = 0.9, label = ~station_name,
+    group  = "CTA L stations"
+  ) |>
+  addLayersControl(
+    overlayGroups = c("Tracts", "CTA L stations"),
+    options       = layersControlOptions(collapsed = FALSE)
+  ) |>
+  addLegend(
+    "bottomright", pal = pal_sf, values = ~sfca_score,
+    title = "2SFCA (×10⁵)", opacity = 0.85
+  )
+```
+
+### LISA clusters of Alpha
+
+```{r map-lisa}
+#| label: map-lisa
+#| results: markup
+
+# Discrete color scheme for cluster categories
+lisa_levels <- c("High-High", "Low-Low", "Low-High", "High-Low", "Not significant")
+lisa_pal <- c(
+  "High-High"       = "#d73027",
+  "Low-Low"         = "#4575b4",
+  "Low-High"        = "#abd9e9",
+  "High-Low"        = "#fdae61",
+  "Not significant" = "#e8e8e8"
+)
+geo$lisa_plot <- factor(
+  ifelse(geo$lisa_p <= 0.05 & geo$lisa_cluster %in% lisa_levels,
+         as.character(geo$lisa_cluster), "Not significant"),
+  levels = lisa_levels
+)
+pal_lisa <- colorFactor(lisa_pal, levels = lisa_levels, na.color = "#e8e8e8")
+
+leaflet(geo) |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addPolygons(
+    fillColor = ~pal_lisa(lisa_plot),
+    weight    = 0.4, color = "white", fillOpacity = 0.85,
+    label     = ~sprintf(
+      "Tract %s<br>Alpha: %.2f<br>LISA: %s (p = %.3f)",
+      GEOID, alpha, as.character(lisa_plot), lisa_p
+    ) |> lapply(htmltools::HTML),
+    group     = "LISA clusters"
+  ) |>
+  addCircleMarkers(
+    data   = stations_geo,
+    radius = 2.5, color = "#111", fillColor = "#ffffff",
+    weight = 0.4, fillOpacity = 0.85,
+    group  = "CTA L stations"
+  ) |>
+  addLayersControl(
+    overlayGroups = c("LISA clusters", "CTA L stations"),
+    options       = layersControlOptions(collapsed = FALSE)
+  ) |>
+  addLegend(
+    "bottomright", pal = pal_lisa, values = lisa_levels,
+    title = "LISA cluster (α index)", opacity = 0.9
+  )
+```
+
+:::
+
+## 4.4 Linked Browser (Top-Alpha Tracts)
+
+Click a table row or map tract to highlight the same High-High alpha tract across both views.
+
+```{r crosstalk}
+#| label: crosstalk
+#| results: markup
+
+# Filter to the High-High cluster (target tracts), then build two parallel
+# views: one sf for the map, one plain tibble for the table. Two SharedData
+# objects with the SAME key + group keep them linked under crosstalk.
+ct_sf <- tract_data |>
+  filter(lisa_cluster == "High-High", lisa_p <= 0.05) |>
+  st_transform(CRS_GEO) |>
+  mutate(
+    label = sprintf(
+      "Tract %s | $/HU %s | SFCA %.2f | &alpha; %.2f",
+      GEOID, dollar(value_per_hu, accuracy = 1), sfca_score, alpha
+    )
+  )
+
+ct_tbl <- ct_sf |>
+  st_drop_geometry() |>
+  transmute(
+    GEOID,
+    Population      = total_pop,
+    `Permit $/HU`   = round(value_per_hu, 0),
+    `SFCA score`    = round(sfca_score, 2),
+    Alpha           = round(alpha, 2),
+    `LISA p`        = round(lisa_p, 3)
+  )
+
+shared_map <- SharedData$new(ct_sf,  key = ~GEOID, group = "alpha")
+shared_tbl <- SharedData$new(ct_tbl, key = ~GEOID, group = "alpha")
+
+bscols(
+  widths = c(6, 6),
+  leaflet(shared_map) |>
+    addProviderTiles(providers$CartoDB.Positron) |>
+    addPolygons(
+      fillColor = "#d73027", weight = 0.6, color = "white",
+      fillOpacity = 0.8, label = ~lapply(label, htmltools::HTML)
+    ),
+  datatable(
+    shared_tbl,
+    extensions = "Scroller",
+    rownames   = FALSE,
+    style      = "bootstrap",
+    class      = "compact cell-border stripe nowrap",
+    width      = "100%",
+    options    = list(
+      dom            = "tip",
+      deferRender    = TRUE,
+      scrollX        = TRUE,
+      scrollY        = 420,
+      scrollCollapse = TRUE,
+      scroller       = TRUE,
+      autoWidth      = TRUE,
+      columnDefs     = list(
+        list(width = "120px", targets = 0),
+        list(width = "95px", targets = 1:5)
+      )
+    )
+  )
+)
+```
+
+# 5. Discussion
+
+The High-High LISA cluster identifies 80 tracts where high alpha values are spatially concentrated: transit access is strong, but permit investment per housing unit remains comparatively low. The table in Section 4.1 lists the highest-alpha target tracts and includes ACS demographic profile columns. The summary in Section 4.2 shows that the High-High cluster has lower median household income than nonsignificant tracts, higher renter share (69.7%), higher non-white share (95.4%), and a much higher median 2SFCA score. This supports the impact-investing thesis, but it should be read as a screening signal for further neighborhood due diligence rather than as proof of investability on its own.
+
+**Caveats.**
+
+- 2SFCA uses Euclidean distance; a street-network refinement (e.g., via
+  `sfnetworks` + OpenStreetMap) would tighten station catchments, especially
+  where rail bisects neighborhoods.
+- Building permits are a *flow* proxy for capital and undercount unpermitted
+  rehab and institutional investment (LIHTC, opportunity-zone equity).
+- The alpha index is descriptive, not causal. A natural extension is a
+  **Spatial Lag Model** regressing investment on accessibility plus ACS
+  controls, with the residuals reinterpreted as model-based alpha.
+
+# Session info {.appendix}
+
+```{r session}
+#| label: session
+#| results: markup
+#| code-fold: true
+sessionInfo()
+```

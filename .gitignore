@@ -1,0 +1,9 @@
+.DS_Store
+.Rhistory
+.RData
+.Ruserdata
+.quarto/
+*_cache/
+*_files/
+final_project.html
+final_project.knit.md
