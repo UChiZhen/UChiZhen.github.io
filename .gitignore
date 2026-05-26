@@ -7,3 +7,10 @@
 *_files/
 final_project.html
 final_project.knit.md
+
+# Local submission and working files
+*.zip
+*.local.md
+Final_Project_Description.docx
+presentation/
+~$*

@@ -87,6 +87,12 @@ CATCHMENT_M <- 1000
 
 # 1. Introduction & Research Question
 
+::: {.callout-note title="Project links"}
+This report is published at [uchizhen.github.io](https://uchizhen.github.io/).
+The full project repository is available at
+[github.com/UChiZhen/UChiZhen.github.io](https://github.com/UChiZhen/UChiZhen.github.io).
+:::
+
 Impact investors increasingly seek **place-based alpha** — neighborhoods whose
 underlying fundamentals (transit, density, demographics) suggest stronger
 performance than current capital flows imply. This report operationalizes that
